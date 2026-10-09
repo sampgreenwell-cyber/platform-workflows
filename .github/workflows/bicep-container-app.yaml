@@ -1,0 +1,386 @@
+# Shared pipeline: Java service -> Azure Container Apps, infrastructure in Bicep.
+# Used by repos generated from the spring-container-app Backstage template:
+#
+#   jobs:
+#     pipeline:
+#       uses: essilor-ditac/platform-workflows/.github/workflows/bicep-container-app.yaml@v1
+#       with:
+#         service-name: orders
+#         image-repository: vxc/orders
+#       secrets: inherit
+#
+# Pull request:  build + test, infra validation, Snyk code + dependency scans, Docker build check.
+# Default branch: the same checks, then build ONE image, push it, deploy to dev, and promote that
+#                 exact image to qa once the "qa" GitHub environment's reviewers approve.
+#
+# Calling repo contract (the template creates all of it):
+#   - pom.xml + mvnw, Dockerfile at the root, app listening on its Container App target port.
+#   - infra/main.bicep with outputs containerAppName and publicBaseUrl, and
+#     infra/<env>.bicepparam reading IMAGE_TAG via readEnvironmentVariable().
+#   - GitHub environments "dev" and "qa" with variables AZURE_CLIENT_ID, AZURE_TENANT_ID,
+#     AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, ACR_NAME; a federated credential for
+#     repo:<org>/<repo>:environment:<env> on each AZURE_CLIENT_ID.
+#   - Org/repo secret SNYK_TOKEN.
+#   - Container Apps it deploys carry tag SourceRepository=<org>/<repo>; the deploy refuses to
+#     touch an existing Container App owned by another repository.
+
+name: Bicep Container App
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: Service name (as in infra/<env>.bicepparam serviceName)
+        type: string
+        required: true
+      image-repository:
+        description: Image repository path in ACR, e.g. vxc/orders
+        type: string
+        required: true
+      java-version:
+        description: Temurin JDK version
+        type: string
+        default: '21'
+      fail-on-security-issues:
+        description: Fail the run on high-severity Snyk findings (scan errors always fail)
+        type: boolean
+        default: true
+      deploy-qa:
+        description: Promote to the qa environment after dev
+        type: boolean
+        default: true
+    secrets:
+      SNYK_TOKEN:
+        required: false
+    outputs:
+      image-tag:
+        description: Image tag built and deployed by this run (empty on pull requests)
+        value: ${{ jobs.deploy-dev.outputs.image-tag }}
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check platform contract
+        env:
+          DEPLOY_QA: ${{ inputs.deploy-qa }}
+        run: |
+          missing=0
+          required=(pom.xml mvnw Dockerfile infra/main.bicep infra/dev.bicepparam)
+          if [ "$DEPLOY_QA" = "true" ]; then required+=(infra/qa.bicepparam); fi
+          for f in "${required[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::Required by the bicep-container-app pipeline but missing: $f"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Build and test
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp verify
+
+      - name: Upload test and coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports/**
+            target/site/jacoco/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Validate infrastructure
+        env:
+          IMAGE_TAG: ci-validate
+        run: |
+          set -euo pipefail
+          az bicep install --only-show-errors
+          az bicep lint --file infra/main.bicep
+          for f in infra/*.bicepparam; do
+            echo "Checking $f"
+            az bicep build-params --file "$f" --stdout > /dev/null
+          done
+
+  security:
+    name: Snyk (code + dependencies)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Require SNYK_TOKEN
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::SNYK_TOKEN is not available to this repository. Add it as an org or repo secret and call this workflow with 'secrets: inherit'."
+            exit 1
+          fi
+
+      - name: Install Snyk CLI
+        run: npm install --global snyk@1 --no-audit --no-fund
+
+      # Exit codes: 0 = clean, 1 = findings at/above the threshold, 2+ = the scan itself failed.
+      - name: Snyk Code (static analysis)
+        id: code
+        run: |
+          chmod +x mvnw
+          set +e
+          snyk code test --severity-threshold=high --sarif-file-output=snyk-code.sarif
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Snyk Open Source (dependencies)
+        id: deps
+        run: |
+          set +e
+          snyk test --severity-threshold=high --fail-on=upgradable --sarif-file-output=snyk-deps.sarif
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Track dependencies in Snyk
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        continue-on-error: true
+        run: snyk monitor --project-name="${GITHUB_REPOSITORY}"
+
+      # Needs code scanning (GitHub Advanced Security on private repos); results stay in the log either way.
+      - name: Upload Snyk Code results
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk dependency results
+        if: always() && hashFiles('snyk-deps.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-open-source
+
+      - name: Security gate
+        env:
+          CODE_RC: ${{ steps.code.outputs.rc }}
+          DEPS_RC: ${{ steps.deps.outputs.rc }}
+          ENFORCE: ${{ inputs.fail-on-security-issues }}
+        run: |
+          status=0
+          for scan in "Snyk Code:$CODE_RC" "Snyk Open Source:$DEPS_RC"; do
+            name="${scan%%:*}"; rc="${scan##*:}"
+            case "$rc" in
+              0) echo "$name: no high-severity issues" ;;
+              1) if [ "$ENFORCE" = "true" ]; then
+                   echo "::error::$name found high-severity issues (see the step log above)"; status=1
+                 else
+                   echo "::warning::$name found high-severity issues (not enforced)"
+                 fi ;;
+              *) echo "::error::$name did not complete (exit code '${rc:-none}')"; status=1 ;;
+            esac
+          done
+          exit "$status"
+
+  image-check:
+    name: Docker build check
+    if: github.event_name == 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (not pushed)
+        run: docker build --tag "ci-check:${GITHUB_SHA::7}" .
+
+  deploy-dev:
+    name: Deploy to dev
+    needs: [build, security]
+    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: deploy-${{ github.repository }}-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image-tag: ${{ steps.tag.outputs.image-tag }}
+    env:
+      DEPLOY_ENV: dev
+      SERVICE_NAME: ${{ inputs.service-name }}
+      IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check environment settings
+        env: &environment-settings
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: &check-settings |
+          missing=0
+          for v in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID RESOURCE_GROUP ACR_NAME; do
+            value="${!v:-}"
+            if [ -z "$value" ] || [[ "$value" == TODO* ]]; then
+              echo "::error::GitHub environment '$DEPLOY_ENV' variable $v is not set (value: '${value}'). Settings > Environments > $DEPLOY_ENV."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@v2
+        with: &azure-login
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Image tag
+        id: tag
+        run: echo "image-tag=dev-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+        run: |
+          set -euo pipefail
+          login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
+          az acr login --name "$ACR_NAME"
+          image="$login_server/$IMAGE_REPOSITORY:$IMAGE_TAG"
+          docker build --tag "$image" --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" .
+          docker push "$image"
+          echo "Pushed $image"
+
+      - name: Deploy and verify
+        env:
+          IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+        run: &deploy |
+          set -euo pipefail
+          param_file="infra/${DEPLOY_ENV}.bicepparam"
+          deployment="${SERVICE_NAME}-${DEPLOY_ENV}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "::group::What-if ($DEPLOY_ENV, image $IMAGE_TAG)"
+          az deployment group what-if --resource-group "$RESOURCE_GROUP" --name "$deployment" \
+            --template-file infra/main.bicep --parameters "$param_file" --no-pretty-print -o json > whatif.json
+          jq -r '.changes[] | select(.changeType != "Ignore") | "\(.changeType)\t\(.resourceId | split("/providers/")[1])"' whatif.json
+          echo "::endgroup::"
+
+          # Ownership guard: never modify a Container App created by another repository.
+          jq -r --arg repo "$GITHUB_REPOSITORY" '
+            .changes[]
+            | select(.changeType == "Modify" or .changeType == "NoChange" or .changeType == "Delete")
+            | select(.resourceId | ascii_downcase | contains("/providers/microsoft.app/containerapps/"))
+            | select((.before.tags.SourceRepository // "") != $repo)
+            | "\(.resourceId | split("/") | last) belongs to \(.before.tags.SourceRepository // "something outside the platform (no SourceRepository tag)")"
+          ' whatif.json > conflicts.txt
+          if [ -s conflicts.txt ]; then
+            while read -r line; do echo "::error::Refusing to deploy: $line, not $GITHUB_REPOSITORY. Pick a different service name."; done < conflicts.txt
+            exit 1
+          fi
+
+          echo "::group::Deploy"
+          az deployment group create --resource-group "$RESOURCE_GROUP" --name "$deployment" \
+            --template-file infra/main.bicep --parameters "$param_file" -o json > deployment.json
+          echo "::endgroup::"
+          app=$(jq -r '.properties.outputs.containerAppName.value' deployment.json)
+          public_url=$(jq -r '.properties.outputs.publicBaseUrl.value // ""' deployment.json)
+
+          # The deployment returns once the revision is provisioned; wait until it is serving.
+          # Readiness uses the /health probe, so Healthy means the app answered its probes.
+          health="" revision="" ready="" image=""
+          for _ in $(seq 1 30); do
+            read -r revision ready image < <(az containerapp show --name "$app" --resource-group "$RESOURCE_GROUP" \
+              --query "[properties.latestRevisionName, properties.latestReadyRevisionName, properties.template.containers[0].image]" -o tsv | tr '\t' ' ')
+            health=$(az containerapp revision show --name "$app" --resource-group "$RESOURCE_GROUP" --revision "$revision" \
+              --query properties.healthState -o tsv)
+            echo "revision=$revision ready=$ready health=$health"
+            if [ "$health" = "Unhealthy" ]; then break; fi
+            if [ "$revision" = "$ready" ] && [ "$health" = "Healthy" ]; then break; fi
+            sleep 10
+          done
+
+          {
+            echo "### $SERVICE_NAME -> $DEPLOY_ENV"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Container App | \`$app\` |"
+            echo "| Revision | \`$revision\` ($health) |"
+            echo "| Image | \`$image\` |"
+            if [ -n "$public_url" ]; then echo "| URL (APIM) | $public_url |"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$image" != *"/$IMAGE_REPOSITORY:$IMAGE_TAG" ]]; then
+            echo "::error::$app runs '$image', expected tag $IMAGE_TAG"
+            exit 1
+          fi
+          if [ "$revision" != "$ready" ] || [ "$health" != "Healthy" ]; then
+            echo "::error::Revision $revision of $app is not serving (health '$health', latest ready revision '$ready'). Check: az containerapp logs show -n $app -g $RESOURCE_GROUP"
+            exit 1
+          fi
+          echo "$app is serving $image"
+
+  deploy-qa:
+    name: Promote to qa
+    needs: deploy-dev
+    if: inputs.deploy-qa
+    runs-on: ubuntu-latest
+    environment: qa
+    concurrency:
+      group: deploy-${{ github.repository }}-qa
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENV: qa
+      SERVICE_NAME: ${{ inputs.service-name }}
+      IMAGE_REPOSITORY: ${{ inputs.image-repository }}
+      IMAGE_TAG: ${{ needs.deploy-dev.outputs.image-tag }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      ACR_NAME: ${{ vars.ACR_NAME }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check environment settings
+        env: *environment-settings
+        run: *check-settings
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@v2
+        with: *azure-login
+
+      # Promotion, not a rebuild: qa runs the exact image dev ran.
+      - name: Confirm the dev image exists
+        run: |
+          set -euo pipefail
+          az acr repository show --name "$ACR_NAME" --image "$IMAGE_REPOSITORY:$IMAGE_TAG" -o none
+          echo "Promoting $IMAGE_REPOSITORY:$IMAGE_TAG"
+
+      - name: Deploy and verify
+        run: *deploy

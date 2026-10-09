@@ -1,0 +1,84 @@
+# Shared teardown for repos from the .NET template: terraform destroy of the service's
+# Container App, using the same state key as container-app.yaml. The caller passes the
+# repository name typed by the person running it; anything else stops the run.
+#
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         confirm: { description: Type the repository name to confirm, required: true, type: string }
+#   jobs:
+#     destroy:
+#       uses: sampgreenwell-cyber/platform-workflows/.github/workflows/destroy-container-app.yaml@v1
+#       with:
+#         confirm: ${{ inputs.confirm }}
+#       secrets: inherit
+
+name: Destroy Container App (Terraform)
+
+on:
+  workflow_call:
+    inputs:
+      confirm:
+        description: Must equal the calling repository's name
+        type: string
+        required: true
+
+jobs:
+  destroy:
+    name: Terraform destroy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      REPO_NAME: ${{ github.event.repository.name }}
+    steps:
+      - name: Confirm
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "$REPO_NAME" ]; then
+            echo "::error::Confirmation '$CONFIRM' does not match the repository name '$REPO_NAME'. Nothing was destroyed."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra
+        env:
+          TFSTATE_RG: ${{ secrets.TFSTATE_RG }}
+          TFSTATE_SA: ${{ secrets.TFSTATE_SA }}
+          TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$REPO_NAME.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=$ARM_CLIENT_ID" \
+            -backend-config="client_secret=$ARM_CLIENT_SECRET" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+      # Variables are required by the module but unused by destroy; the image value is a placeholder.
+      - name: Terraform destroy
+        working-directory: infra
+        env:
+          SHARED_CAE_ID: ${{ secrets.SHARED_CAE_ID }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="service_name=$REPO_NAME" \
+            -var="image=unused-for-destroy" \
+            -var="container_apps_environment_id=$SHARED_CAE_ID" \
+            -var="ghcr_pat=$GHCR_PAT" \
+            -var="ghcr_username=$GITHUB_ACTOR"

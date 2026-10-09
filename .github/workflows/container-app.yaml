@@ -1,0 +1,119 @@
+# Shared pipeline: build the repo's Dockerfile, push to GHCR, deploy with the repo's infra/
+# Terraform (sampgreenwell-cyber/terraform-modules container-app-service). Used by repos from
+# the .NET template:
+#
+#   jobs:
+#     deploy:
+#       uses: sampgreenwell-cyber/platform-workflows/.github/workflows/container-app.yaml@v1
+#       secrets: inherit
+#
+# Inside a called workflow, github.* is the calling repo: checkout, the repo name (service name
+# and state key) and infra/ all come from the service.
+#
+# Repo secrets (set-platform-secrets.ps1): GHCR_PAT, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
+# AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, TFSTATE_RG, TFSTATE_SA, TFSTATE_CONTAINER, SHARED_CAE_ID.
+# Caller permissions: contents: read, packages: write.
+
+name: Container App (Terraform)
+
+on:
+  workflow_call: {}
+
+jobs:
+  build-and-push:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Check repo secrets
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          TFSTATE_RG: ${{ secrets.TFSTATE_RG }}
+          TFSTATE_SA: ${{ secrets.TFSTATE_SA }}
+          TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+          SHARED_CAE_ID: ${{ secrets.SHARED_CAE_ID }}
+        run: |
+          missing=0
+          for s in GHCR_PAT AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID TFSTATE_RG TFSTATE_SA TFSTATE_CONTAINER SHARED_CAE_ID; do
+            if [ -z "${!s:-}" ]; then echo "::error::Repo secret $s is not set. Run set-platform-secrets.ps1 -RepoName ${GITHUB_REPOSITORY#*/}"; missing=1; fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        # GHCR image names must be lowercase.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: echo "$GHCR_PAT" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy:
+    name: Terraform apply
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra
+        env:
+          TFSTATE_RG: ${{ secrets.TFSTATE_RG }}
+          TFSTATE_SA: ${{ secrets.TFSTATE_SA }}
+          TFSTATE_CONTAINER: ${{ secrets.TFSTATE_CONTAINER }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$REPO_NAME.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=$ARM_CLIENT_ID" \
+            -backend-config="client_secret=$ARM_CLIENT_SECRET" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+      - name: Terraform apply
+        working-directory: infra
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          SHARED_CAE_ID: ${{ secrets.SHARED_CAE_ID }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          terraform apply -auto-approve \
+            -var="service_name=$REPO_NAME" \
+            -var="image=$IMAGE" \
+            -var="container_apps_environment_id=$SHARED_CAE_ID" \
+            -var="ghcr_pat=$GHCR_PAT" \
+            -var="ghcr_username=$GITHUB_ACTOR"
