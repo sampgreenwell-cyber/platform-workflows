@@ -19,7 +19,8 @@
 #     infra/<env>.bicepparam reading IMAGE_TAG via readEnvironmentVariable().
 #   - GitHub environments "dev" and "qa" with variables AZURE_CLIENT_ID, AZURE_TENANT_ID,
 #     AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, ACR_NAME; a federated credential for
-#     repo:<org>/<repo>:environment:<env> on each AZURE_CLIENT_ID.
+#     <prefix>:environment:<env> on each AZURE_CLIENT_ID (prefix: repo:<org>/<repo>, or with immutable
+#     subjects repo:<org>@<id>/<repo>@<id>; see README).
 #   - Org/repo secret SNYK_TOKEN.
 #   - Container Apps it deploys carry tag SourceRepository=<org>/<repo>; the deploy refuses to
 #     touch an existing Container App owned by another repository.
@@ -315,8 +316,11 @@ jobs:
           # Readiness uses the /health probe, so Healthy means the app answered its probes.
           health="" revision="" ready="" image=""
           for _ in $(seq 1 30); do
-            read -r revision ready image < <(az containerapp show --name "$app" --resource-group "$RESOURCE_GROUP" \
-              --query "[properties.latestRevisionName, properties.latestReadyRevisionName, properties.template.containers[0].image]" -o tsv | tr '\t' ' ')
+            # JSON + jq, not a tsv list: az prints a tsv list one value per line, and nulls must stay empty.
+            az containerapp show --name "$app" --resource-group "$RESOURCE_GROUP" -o json > app.json
+            revision=$(jq -r '.properties.latestRevisionName // ""' app.json)
+            ready=$(jq -r '.properties.latestReadyRevisionName // ""' app.json)
+            image=$(jq -r '.properties.template.containers[0].image // ""' app.json)
             health=$(az containerapp revision show --name "$app" --resource-group "$RESOURCE_GROUP" --revision "$revision" \
               --query properties.healthState -o tsv)
             echo "revision=$revision ready=$ready health=$health"
