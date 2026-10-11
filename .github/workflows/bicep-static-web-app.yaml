@@ -27,9 +27,13 @@
 #   - package.json + package-lock.json; npm scripts build (and optionally lint, test).
 #   - .env.dev / .env.qa with the environment's non-secret NEXT_PUBLIC_* values.
 #   - Optional staticwebapp.config.<env>.json, copied to staticwebapp.config.json at deploy.
+#   - Optional Front Door: when infra outputs a frontDoorId, the pipeline locks the Static Web App to
+#     that Front Door (networking + forwardingGateway in staticwebapp.config.json) and verifies through
+#     publicHostname; the direct azurestaticapps.net address must then be refused.
 #   - GET /api/health returning {"version": process.env.NEXT_PUBLIC_APP_VERSION}, and the
 #     /api/bff/* server-side proxy to the BFF.
-#   - infra/main.bicep with outputs staticWebAppName and defaultHostname; infra/<env>.bicepparam.
+#   - infra/main.bicep with outputs staticWebAppName and defaultHostname (optionally publicHostname,
+#     frontDoorId, dnsCnameTarget, dnsValidationToken); infra/<env>.bicepparam.
 #   - GitHub environments "dev" and "qa" with variables AZURE_CLIENT_ID, AZURE_TENANT_ID,
 #     AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, and a federated credential for
 #     <prefix>:environment:<env> on each AZURE_CLIENT_ID.
@@ -305,8 +309,14 @@ jobs:
           az deployment group create --resource-group "$RESOURCE_GROUP" --name "$deployment" \
             --template-file infra/main.bicep --parameters "$param_file" -o json > deployment.json
           echo "::endgroup::"
-          echo "name=$(jq -r '.properties.outputs.staticWebAppName.value' deployment.json)" >> "$GITHUB_OUTPUT"
-          echo "host=$(jq -r '.properties.outputs.defaultHostname.value' deployment.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "name=$(jq -r '.properties.outputs.staticWebAppName.value' deployment.json)"
+            echo "host=$(jq -r '.properties.outputs.defaultHostname.value' deployment.json)"
+            echo "public-host=$(jq -r '.properties.outputs.publicHostname.value // .properties.outputs.defaultHostname.value' deployment.json)"
+            echo "front-door-id=$(jq -r '.properties.outputs.frontDoorId.value // ""' deployment.json)"
+            echo "dns-cname=$(jq -r '.properties.outputs.dnsCnameTarget.value // ""' deployment.json)"
+            echo "dns-token=$(jq -r '.properties.outputs.dnsValidationToken.value // ""' deployment.json)"
+          } >> "$GITHUB_OUTPUT"
 
       # Read at deploy time and masked: no deployment-token secret is stored in the repo.
       - name: Deployment token
@@ -321,13 +331,29 @@ jobs:
 
       - name: Prepare build for this environment
         id: prepare
+        env: &front-door-env
+          FRONT_DOOR_ID: ${{ steps.infra.outputs.front-door-id }}
+          PUBLIC_HOST: ${{ steps.infra.outputs.public-host }}
         run: &prepare-build |
           set -euo pipefail
           cp ".env.${DEPLOY_ENV}" .env.production
           version="${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           printf '\nNEXT_PUBLIC_APP_VERSION=%s\n' "$version" >> .env.production
+          config='{}'
           if [ -f "staticwebapp.config.${DEPLOY_ENV}.json" ]; then
-            cp "staticwebapp.config.${DEPLOY_ENV}.json" staticwebapp.config.json
+            config=$(cat "staticwebapp.config.${DEPLOY_ENV}.json")
+          fi
+          # Behind Front Door: accept only Front Door's traffic carrying this profile's ID, so the
+          # azurestaticapps.net address can't be used to bypass the WAF.
+          if [ -n "$FRONT_DOOR_ID" ]; then
+            config=$(jq --arg id "$FRONT_DOOR_ID" --arg host "$PUBLIC_HOST" '
+              .networking.allowedIpRanges = ["AzureFrontDoor.Backend"]
+              | .forwardingGateway.requiredHeaders["X-Azure-FDID"] = $id
+              | .forwardingGateway.allowedForwardedHosts = [$host]' <<< "$config")
+          fi
+          if [ "$config" != '{}' ]; then
+            echo "$config" > staticwebapp.config.json
+            echo "::group::staticwebapp.config.json"; cat staticwebapp.config.json; echo "::endgroup::"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
@@ -344,30 +370,60 @@ jobs:
         env: &verify-env
           SWA_HOST: ${{ steps.infra.outputs.host }}
           SWA_NAME: ${{ steps.infra.outputs.name }}
+          PUBLIC_HOST: ${{ steps.infra.outputs.public-host }}
+          FRONT_DOOR_ID: ${{ steps.infra.outputs.front-door-id }}
+          DNS_CNAME: ${{ steps.infra.outputs.dns-cname }}
+          DNS_TOKEN: ${{ steps.infra.outputs.dns-token }}
           EXPECTED_VERSION: ${{ steps.prepare.outputs.version }}
         run: &verify |
           set -euo pipefail
+          if [ -n "$DNS_TOKEN" ]; then
+            {
+              echo "### DNS records for $PUBLIC_HOST"
+              echo "| Type | Name | Value |"
+              echo "|---|---|---|"
+              echo "| TXT | \`_dnsauth.$PUBLIC_HOST\` | \`$DNS_TOKEN\` |"
+              echo "| CNAME | \`$PUBLIC_HOST\` | \`$DNS_CNAME\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if ! getent hosts "$PUBLIC_HOST" > /dev/null; then
+              echo "::warning::$PUBLIC_HOST doesn't resolve yet. Add the DNS records in the run summary; Front Door then issues the certificate and the next run verifies the site. Nothing else was checked."
+              exit 0
+            fi
+          fi
+
+          # A new Front Door endpoint or route can take several minutes to start serving.
+          attempts=30
+          if [ -n "$FRONT_DOOR_ID" ]; then attempts=90; fi
           version=""
-          for _ in $(seq 1 30); do
-            version=$(curl -fsS "https://$SWA_HOST/api/health" | jq -r '.version // ""' || true)
+          for _ in $(seq 1 "$attempts"); do
+            version=$(curl -fsS "https://$PUBLIC_HOST/api/health" | jq -r '.version // ""' || true)
             echo "serving version '$version' (expecting $EXPECTED_VERSION)"
             if [ "$version" = "$EXPECTED_VERSION" ]; then break; fi
             sleep 10
           done
-          bff_status=$(curl -s -o /dev/null -w '%{http_code}' "https://$SWA_HOST/api/bff/health" || true)
+          bff_status=$(curl -s -o /dev/null -w '%{http_code}' "https://$PUBLIC_HOST/api/bff/health" || true)
+          direct_status=""
+          if [ -n "$FRONT_DOOR_ID" ]; then
+            direct_status=$(curl -s -o /dev/null -w '%{http_code}' "https://$SWA_HOST/api/health" || true)
+          fi
 
           {
             echo "### $APP_NAME -> $DEPLOY_ENV"
             echo "| | |"
             echo "|---|---|"
             echo "| Static Web App | \`$SWA_NAME\` |"
-            echo "| URL | https://$SWA_HOST |"
+            echo "| URL | https://$PUBLIC_HOST |"
             echo "| Version | \`$version\` |"
             echo "| BFF through APIM (/api/bff/health) | $bff_status |"
+            if [ -n "$FRONT_DOOR_ID" ]; then echo "| Direct https://$SWA_HOST (must be refused) | $direct_status |"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$version" != "$EXPECTED_VERSION" ]; then
-            echo "::error::https://$SWA_HOST/api/health reports version '$version', expected $EXPECTED_VERSION"
+            echo "::error::https://$PUBLIC_HOST/api/health reports version '$version', expected $EXPECTED_VERSION"
+            exit 1
+          fi
+          if [ -n "$FRONT_DOOR_ID" ] && [ "$direct_status" != "403" ]; then
+            echo "::error::https://$SWA_HOST answered $direct_status: the Static Web App isn't locked to Front Door (expected 403)"
             exit 1
           fi
           if [ "$bff_status" != "200" ]; then
@@ -433,6 +489,7 @@ jobs:
 
       - name: Prepare build for this environment
         id: prepare
+        env: *front-door-env
         run: *prepare-build
 
       - name: Build and upload
