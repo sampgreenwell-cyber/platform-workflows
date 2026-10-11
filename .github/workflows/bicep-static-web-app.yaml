@@ -93,6 +93,15 @@ jobs:
               missing=1
             fi
           done
+          # The deploy step builds with the newest Node that engines.node allows, and Static Web Apps
+          # only runs 18, 20 or 22 for server-rendered apps: an open range like >=20 picks 24 and fails.
+          if [ -f package.json ]; then
+            engines=$(jq -r '.engines.node // ""' package.json)
+            if ! [[ "$engines" =~ ^(18|20|22)(\.x)?$ ]]; then
+              echo "::error file=package.json::engines.node must pin a Node version Static Web Apps runs (18.x, 20.x or 22.x), not '${engines}'"
+              missing=1
+            fi
+          fi
           exit "$missing"
 
       - uses: actions/setup-node@v4
