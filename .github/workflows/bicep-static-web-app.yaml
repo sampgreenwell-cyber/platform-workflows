@@ -1,0 +1,435 @@
+# Shared pipeline: Next.js UI -> Azure Static Web Apps, infrastructure in Bicep.
+# Used by repos generated from the nextjs-web-app Backstage template:
+#
+#   jobs:
+#     pipeline:
+#       uses: essilor-ditac/platform-workflows/.github/workflows/bicep-static-web-app.yaml@v1
+#       with:
+#         app-name: storefront
+#         release-model: environment-branches
+#       secrets: inherit
+#
+# Pull request: build + test, infra validation, Snyk code + dependency scans; with
+#               environment branches, a pull request into qa must come from dev.
+# Deploy:       Bicep (Static Web App, its APIM subscription to the BFF, app settings), then build
+#               with .env.<env> and upload with a deployment token fetched at deploy time. Verified
+#               through /api/health (this run's version) and /api/bff/health (UI -> APIM -> BFF).
+#
+# Release models (same as bicep-container-app.yaml):
+#   trunk                 push to the default branch -> dev, then qa after the "qa" environment's
+#                         reviewers approve (same commit, rebuilt with .env.qa).
+#   environment-branches  push to dev -> dev; push to qa -> qa after approval, only if that exact
+#                         code (git tree) is already on dev.
+# NEXT_PUBLIC_* values are compiled into the bundle, so each environment gets its own build of
+# the same code; there is no single artifact to promote.
+#
+# Calling repo contract (the template creates all of it):
+#   - package.json + package-lock.json; npm scripts build (and optionally lint, test).
+#   - .env.dev / .env.qa with the environment's non-secret NEXT_PUBLIC_* values.
+#   - Optional staticwebapp.config.<env>.json, copied to staticwebapp.config.json at deploy.
+#   - GET /api/health returning {"version": process.env.NEXT_PUBLIC_APP_VERSION}, and the
+#     /api/bff/* server-side proxy to the BFF.
+#   - infra/main.bicep with outputs staticWebAppName and defaultHostname; infra/<env>.bicepparam.
+#   - GitHub environments "dev" and "qa" with variables AZURE_CLIENT_ID, AZURE_TENANT_ID,
+#     AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, and a federated credential for
+#     <prefix>:environment:<env> on each AZURE_CLIENT_ID.
+#   - Org/repo secret SNYK_TOKEN.
+#   - Static Web Apps it deploys carry tag SourceRepository=<org>/<repo>; the deploy refuses to
+#     touch an existing Static Web App owned by another repository.
+
+name: Bicep Static Web App
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: App name (as in infra/<env>.bicepparam appName)
+        type: string
+        required: true
+      release-model:
+        description: trunk or environment-branches (see the header)
+        type: string
+        default: trunk
+      node-version:
+        description: Node.js version for build, test and scans
+        type: string
+        default: '22'
+      fail-on-security-issues:
+        description: Fail the run on high-severity Snyk findings (scan errors always fail)
+        type: boolean
+        default: true
+      deploy-qa:
+        description: Deploy to the qa environment
+        type: boolean
+        default: true
+    secrets:
+      SNYK_TOKEN:
+        required: false
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check platform contract
+        env:
+          DEPLOY_QA: ${{ inputs.deploy-qa }}
+          RELEASE_MODEL: ${{ inputs.release-model }}
+        run: |
+          missing=0
+          case "$RELEASE_MODEL" in
+            trunk|environment-branches) ;;
+            *) echo "::error::release-model must be trunk or environment-branches, not '$RELEASE_MODEL'"; missing=1 ;;
+          esac
+          required=(package.json package-lock.json .env.dev infra/main.bicep infra/dev.bicepparam)
+          if [ "$DEPLOY_QA" = "true" ]; then required+=(.env.qa infra/qa.bicepparam); fi
+          for f in "${required[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::Required by the bicep-static-web-app pipeline but missing: $f"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Install, lint, test, build
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run lint --if-present
+          npm test --if-present
+          cp .env.dev .env.production
+          npm run build
+
+      - name: Validate infrastructure
+        run: |
+          set -euo pipefail
+          az bicep install --only-show-errors
+          az bicep lint --file infra/main.bicep
+          for f in infra/*.bicepparam; do
+            echo "Checking $f"
+            az bicep build-params --file "$f" --stdout > /dev/null
+          done
+
+  security:
+    name: Snyk (code + dependencies)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Require SNYK_TOKEN
+        run: |
+          if [ -z "$SNYK_TOKEN" ]; then
+            echo "::error::SNYK_TOKEN is not available to this repository. Add it as an org or repo secret and call this workflow with 'secrets: inherit'."
+            exit 1
+          fi
+
+      - name: Install dependencies and Snyk CLI
+        run: |
+          npm ci --no-audit --no-fund --ignore-scripts
+          npm install --global snyk@1 --no-audit --no-fund
+
+      # Exit codes: 0 = clean, 1 = findings at/above the threshold, 2+ = the scan itself failed.
+      - name: Snyk Code (static analysis)
+        id: code
+        run: |
+          set +e
+          snyk code test --severity-threshold=high --sarif-file-output=snyk-code.sarif
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Snyk Open Source (dependencies)
+        id: deps
+        run: |
+          set +e
+          snyk test --severity-threshold=high --fail-on=upgradable --sarif-file-output=snyk-deps.sarif
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Track dependencies in Snyk
+        if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        continue-on-error: true
+        run: snyk monitor --project-name="${GITHUB_REPOSITORY}"
+
+      # Needs code scanning (GitHub Advanced Security on private repos); results stay in the log either way.
+      - name: Upload Snyk Code results
+        if: always() && hashFiles('snyk-code.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk dependency results
+        if: always() && hashFiles('snyk-deps.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-deps.sarif
+          category: snyk-open-source
+
+      - name: Security gate
+        env:
+          CODE_RC: ${{ steps.code.outputs.rc }}
+          DEPS_RC: ${{ steps.deps.outputs.rc }}
+          ENFORCE: ${{ inputs.fail-on-security-issues }}
+        run: |
+          status=0
+          for scan in "Snyk Code:$CODE_RC" "Snyk Open Source:$DEPS_RC"; do
+            name="${scan%%:*}"; rc="${scan##*:}"
+            case "$rc" in
+              0) echo "$name: no high-severity issues" ;;
+              1) if [ "$ENFORCE" = "true" ]; then
+                   echo "::error::$name found high-severity issues (see the step log above)"; status=1
+                 else
+                   echo "::warning::$name found high-severity issues (not enforced)"
+                 fi ;;
+              *) echo "::error::$name did not complete (exit code '${rc:-none}')"; status=1 ;;
+            esac
+          done
+          exit "$status"
+
+  promotion-source:
+    name: Promotion source
+    if: github.event_name == 'pull_request' && inputs.release-model == 'environment-branches' && github.base_ref == 'qa'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Pull requests into qa come from dev
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::qa only takes pull requests from dev (this one is from '$HEAD_REF'). Merge the change into dev first, let it deploy, then open dev -> qa."
+            exit 1
+          fi
+
+  deploy-dev:
+    name: Deploy to dev
+    needs: [build, security]
+    if: >-
+      github.event_name != 'pull_request' && (
+        (inputs.release-model == 'trunk' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+        (inputs.release-model == 'environment-branches' && github.ref == 'refs/heads/dev'))
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: deploy-${{ github.repository }}-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENV: dev
+      APP_NAME: ${{ inputs.app-name }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check environment settings
+        env: &environment-settings
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: &check-settings |
+          missing=0
+          for v in AZURE_CLIENT_ID AZURE_TENANT_ID AZURE_SUBSCRIPTION_ID RESOURCE_GROUP; do
+            value="${!v:-}"
+            if [ -z "$value" ] || [[ "$value" == TODO* ]]; then
+              echo "::error::GitHub environment '$DEPLOY_ENV' variable $v is not set (value: '${value}'). Settings > Environments > $DEPLOY_ENV."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@v2
+        with: &azure-login
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy infrastructure
+        id: infra
+        run: &deploy-infra |
+          set -euo pipefail
+          param_file="infra/${DEPLOY_ENV}.bicepparam"
+          deployment="${APP_NAME}-${DEPLOY_ENV}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "::group::What-if ($DEPLOY_ENV)"
+          az deployment group what-if --resource-group "$RESOURCE_GROUP" --name "$deployment" \
+            --template-file infra/main.bicep --parameters "$param_file" --no-pretty-print -o json > whatif.json
+          jq -r '.changes[] | select(.changeType != "Ignore") | "\(.changeType)\t\(.resourceId | split("/providers/")[1])"' whatif.json
+          echo "::endgroup::"
+
+          # Ownership guard: never modify a Static Web App created by another repository.
+          jq -r --arg repo "$GITHUB_REPOSITORY" '
+            .changes[]
+            | select(.changeType == "Modify" or .changeType == "NoChange" or .changeType == "Delete")
+            | select(.resourceId | ascii_downcase | test("/providers/microsoft.web/staticsites/[^/]+$"))
+            | select((.before.tags.SourceRepository // "") != $repo)
+            | "\(.resourceId | split("/") | last) belongs to \(.before.tags.SourceRepository // "something outside the platform (no SourceRepository tag)")"
+          ' whatif.json > conflicts.txt
+          if [ -s conflicts.txt ]; then
+            while read -r line; do echo "::error::Refusing to deploy: $line, not $GITHUB_REPOSITORY. Pick a different app name."; done < conflicts.txt
+            exit 1
+          fi
+
+          echo "::group::Deploy"
+          az deployment group create --resource-group "$RESOURCE_GROUP" --name "$deployment" \
+            --template-file infra/main.bicep --parameters "$param_file" -o json > deployment.json
+          echo "::endgroup::"
+          echo "name=$(jq -r '.properties.outputs.staticWebAppName.value' deployment.json)" >> "$GITHUB_OUTPUT"
+          echo "host=$(jq -r '.properties.outputs.defaultHostname.value' deployment.json)" >> "$GITHUB_OUTPUT"
+
+      # Read at deploy time and masked: no deployment-token secret is stored in the repo.
+      - name: Deployment token
+        id: token
+        env: &swa-name
+          SWA_NAME: ${{ steps.infra.outputs.name }}
+        run: &get-token |
+          set -euo pipefail
+          token=$(az staticwebapp secrets list --name "$SWA_NAME" --resource-group "$RESOURCE_GROUP" --query properties.apiKey -o tsv)
+          echo "::add-mask::$token"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build for this environment
+        id: prepare
+        run: &prepare-build |
+          set -euo pipefail
+          cp ".env.${DEPLOY_ENV}" .env.production
+          version="${GITHUB_SHA::7}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '\nNEXT_PUBLIC_APP_VERSION=%s\n' "$version" >> .env.production
+          if [ -f "staticwebapp.config.${DEPLOY_ENV}.json" ]; then
+            cp "staticwebapp.config.${DEPLOY_ENV}.json" staticwebapp.config.json
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build and upload
+        uses: Azure/static-web-apps-deploy@v1
+        with: &swa-upload
+          azure_static_web_apps_api_token: ${{ steps.token.outputs.token }}
+          action: upload
+          app_location: /
+          api_location: ''
+          output_location: ''   # Next.js hybrid (standalone): the build packages the server
+
+      - name: Verify
+        env: &verify-env
+          SWA_HOST: ${{ steps.infra.outputs.host }}
+          SWA_NAME: ${{ steps.infra.outputs.name }}
+          EXPECTED_VERSION: ${{ steps.prepare.outputs.version }}
+        run: &verify |
+          set -euo pipefail
+          version=""
+          for _ in $(seq 1 30); do
+            version=$(curl -fsS "https://$SWA_HOST/api/health" | jq -r '.version // ""' || true)
+            echo "serving version '$version' (expecting $EXPECTED_VERSION)"
+            if [ "$version" = "$EXPECTED_VERSION" ]; then break; fi
+            sleep 10
+          done
+          bff_status=$(curl -s -o /dev/null -w '%{http_code}' "https://$SWA_HOST/api/bff/health" || true)
+
+          {
+            echo "### $APP_NAME -> $DEPLOY_ENV"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Static Web App | \`$SWA_NAME\` |"
+            echo "| URL | https://$SWA_HOST |"
+            echo "| Version | \`$version\` |"
+            echo "| BFF through APIM (/api/bff/health) | $bff_status |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$version" != "$EXPECTED_VERSION" ]; then
+            echo "::error::https://$SWA_HOST/api/health reports version '$version', expected $EXPECTED_VERSION"
+            exit 1
+          fi
+          if [ "$bff_status" != "200" ]; then
+            echo "::error::The UI is live but /api/bff/health returned $bff_status. 401: the APIM subscription key is wrong; 404: the BFF API path (bffName/apimApiSuffix in infra/$DEPLOY_ENV.bicepparam); 5xx: the BFF itself."
+            exit 1
+          fi
+          echo "$SWA_NAME is serving $version and reaches the BFF"
+
+  deploy-qa:
+    name: Deploy to qa
+    needs: [build, security, deploy-dev]
+    if: >-
+      !cancelled() && inputs.deploy-qa &&
+      needs.build.result == 'success' && needs.security.result == 'success' && (
+        (inputs.release-model == 'trunk' && needs.deploy-dev.result == 'success') ||
+        (inputs.release-model == 'environment-branches' && github.event_name != 'pull_request' && github.ref == 'refs/heads/qa'))
+    runs-on: ubuntu-latest
+    environment: qa
+    concurrency:
+      group: deploy-${{ github.repository }}-qa
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      DEPLOY_ENV: qa
+      APP_NAME: ${{ inputs.app-name }}
+      RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+      RELEASE_MODEL: ${{ inputs.release-model }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Environment branches: qa only ships code that already went through dev.
+      - name: Check this code is on dev
+        if: inputs.release-model == 'environment-branches'
+        run: |
+          set -euo pipefail
+          tree=$(git rev-parse 'HEAD^{tree}')
+          if ! git log origin/dev --format=%T | grep -qx "$tree"; then
+            echo "::error::This qa commit's code (tree $tree) was never on dev. Make the change on dev first, then promote dev -> qa."
+            exit 1
+          fi
+          echo "Code matches a dev commit (tree $tree)"
+
+      - name: Check environment settings
+        env: *environment-settings
+        run: *check-settings
+
+      - name: Azure sign-in (OIDC)
+        uses: azure/login@v2
+        with: *azure-login
+
+      - name: Deploy infrastructure
+        id: infra
+        run: *deploy-infra
+
+      - name: Deployment token
+        id: token
+        env: *swa-name
+        run: *get-token
+
+      - name: Prepare build for this environment
+        id: prepare
+        run: *prepare-build
+
+      - name: Build and upload
+        uses: Azure/static-web-apps-deploy@v1
+        with: *swa-upload
+
+      - name: Verify
+        env: *verify-env
+        run: *verify

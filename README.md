@@ -7,6 +7,9 @@ Reusable GitHub Actions workflows called by repos generated from `sampgreenwell-
 | `container-app.yaml` | `dotnet-service` template | Build the Dockerfile, push to GHCR, `terraform apply` the repo's `infra/` (module `terraform-modules//container-app-service`). Auth: repo secrets from `set-platform-secrets.ps1`. |
 | `destroy-container-app.yaml` | `dotnet-service` template | `terraform destroy` of that service, after the person running it types the repo name. |
 | `bicep-container-app.yaml` | `spring-container-app-lab` template | The same file as the work golden path: Maven build/test, Snyk, one image to ACR, Bicep deploy to dev, promotion to qa after approval. Auth: OIDC with GitHub environment variables. |
+| `bicep-static-web-app.yaml` | `nextjs-web-app-lab` template | The same file as the work golden path: npm build/test, Snyk, Bicep (Static Web App + its APIM subscription to the BFF), build with `.env.<env>` and upload with a deploy token read at deploy time, then check `/api/health` and `/api/bff/health`. Auth: OIDC. |
+
+Both Bicep pipelines take `release-model`: `trunk` (default; one branch, dev then qa after approval) or `environment-branches` (push to `dev` deploys dev, push to `qa` deploys qa after approval, only with code that already went through dev).
 
 Each service's short caller pins `@v1`:
 ```yaml

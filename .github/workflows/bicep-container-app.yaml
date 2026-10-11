@@ -10,8 +10,14 @@
 #       secrets: inherit
 #
 # Pull request:  build + test, infra validation, Snyk code + dependency scans, Docker build check.
-# Default branch: the same checks, then build ONE image, push it, deploy to dev, and promote that
-#                 exact image to qa once the "qa" GitHub environment's reviewers approve.
+#
+# Release models (input release-model; same as bicep-static-web-app.yaml):
+#   trunk (default)       push to the default branch -> build ONE image, push it, deploy to dev, and
+#                         promote that exact image to qa once the "qa" environment's reviewers approve.
+#   environment-branches  push to dev -> build, push and deploy to dev (the image also gets a
+#                         tree-<git tree> tag); push to qa -> after approval, deploy the image dev built
+#                         from the same code. qa never builds: if dev never built this code, it fails.
+#                         Pull requests into qa must come from dev.
 #
 # Calling repo contract (the template creates all of it):
 #   - pom.xml + mvnw, Dockerfile at the root, app listening on its Container App target port.
@@ -38,6 +44,10 @@ on:
         description: Image repository path in ACR, e.g. vxc/orders
         type: string
         required: true
+      release-model:
+        description: trunk or environment-branches (see the header)
+        type: string
+        default: trunk
       java-version:
         description: Temurin JDK version
         type: string
@@ -55,7 +65,7 @@ on:
         required: false
     outputs:
       image-tag:
-        description: Image tag built and deployed by this run (empty on pull requests)
+        description: Image tag built and deployed to dev by this run (empty when dev was not deployed)
         value: ${{ jobs.deploy-dev.outputs.image-tag }}
 
 jobs:
@@ -70,8 +80,13 @@ jobs:
       - name: Check platform contract
         env:
           DEPLOY_QA: ${{ inputs.deploy-qa }}
+          RELEASE_MODEL: ${{ inputs.release-model }}
         run: |
           missing=0
+          case "$RELEASE_MODEL" in
+            trunk|environment-branches) ;;
+            *) echo "::error::release-model must be trunk or environment-branches, not '$RELEASE_MODEL'"; missing=1 ;;
+          esac
           required=(pom.xml mvnw Dockerfile infra/main.bicep infra/dev.bicepparam)
           if [ "$DEPLOY_QA" = "true" ]; then required+=(infra/qa.bicepparam); fi
           for f in "${required[@]}"; do
@@ -215,10 +230,28 @@ jobs:
       - name: Build image (not pushed)
         run: docker build --tag "ci-check:${GITHUB_SHA::7}" .
 
+  promotion-source:
+    name: Promotion source
+    if: github.event_name == 'pull_request' && inputs.release-model == 'environment-branches' && github.base_ref == 'qa'
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Pull requests into qa come from dev
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "dev" ]; then
+            echo "::error::qa only takes pull requests from dev (this one is from '$HEAD_REF'). Merge the change into dev first, let it deploy, then open dev -> qa."
+            exit 1
+          fi
+
   deploy-dev:
     name: Deploy to dev
     needs: [build, security]
-    if: github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    if: >-
+      github.event_name != 'pull_request' && (
+        (inputs.release-model == 'trunk' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+        (inputs.release-model == 'environment-branches' && github.ref == 'refs/heads/dev'))
     runs-on: ubuntu-latest
     environment: dev
     concurrency:
@@ -263,11 +296,15 @@ jobs:
 
       - name: Image tag
         id: tag
-        run: echo "image-tag=dev-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "image-tag=dev-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "tree-tag=tree-$(git rev-parse 'HEAD^{tree}' | cut -c1-12)" >> "$GITHUB_OUTPUT"
 
       - name: Build and push image
         env:
           IMAGE_TAG: ${{ steps.tag.outputs.image-tag }}
+          TREE_TAG: ${{ steps.tag.outputs.tree-tag }}
+          RELEASE_MODEL: ${{ inputs.release-model }}
         run: |
           set -euo pipefail
           login_server=$(az acr show --name "$ACR_NAME" --query loginServer -o tsv)
@@ -277,6 +314,12 @@ jobs:
             --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" .
           docker push "$image"
           echo "Pushed $image"
+          # Environment branches: qa finds this image by the code it was built from.
+          if [ "$RELEASE_MODEL" = "environment-branches" ]; then
+            docker tag "$image" "$login_server/$IMAGE_REPOSITORY:$TREE_TAG"
+            docker push "$login_server/$IMAGE_REPOSITORY:$TREE_TAG"
+            echo "Also tagged $TREE_TAG"
+          fi
 
       - name: Deploy and verify
         env:
@@ -351,8 +394,12 @@ jobs:
 
   deploy-qa:
     name: Promote to qa
-    needs: deploy-dev
-    if: inputs.deploy-qa
+    needs: [build, security, deploy-dev]
+    if: >-
+      !cancelled() && inputs.deploy-qa &&
+      needs.build.result == 'success' && needs.security.result == 'success' && (
+        (inputs.release-model == 'trunk' && needs.deploy-dev.result == 'success') ||
+        (inputs.release-model == 'environment-branches' && github.event_name != 'pull_request' && github.ref == 'refs/heads/qa'))
     runs-on: ubuntu-latest
     environment: qa
     concurrency:
@@ -365,7 +412,8 @@ jobs:
       DEPLOY_ENV: qa
       SERVICE_NAME: ${{ inputs.service-name }}
       IMAGE_REPOSITORY: ${{ inputs.image-repository }}
-      IMAGE_TAG: ${{ needs.deploy-dev.outputs.image-tag }}
+      DEV_IMAGE_TAG: ${{ needs.deploy-dev.outputs.image-tag }}
+      RELEASE_MODEL: ${{ inputs.release-model }}
       RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
       ACR_NAME: ${{ vars.ACR_NAME }}
     steps:
@@ -380,11 +428,22 @@ jobs:
         with: *azure-login
 
       # Promotion, not a rebuild: qa runs the exact image dev ran.
-      - name: Confirm the dev image exists
+      # trunk: the image this run deployed to dev. environment-branches: the image dev built from
+      # the same code (git tree), so qa never runs anything dev didn't.
+      - name: Find the dev image
         run: |
           set -euo pipefail
-          az acr repository show --name "$ACR_NAME" --image "$IMAGE_REPOSITORY:$IMAGE_TAG" -o none
-          echo "Promoting $IMAGE_REPOSITORY:$IMAGE_TAG"
+          if [ "$RELEASE_MODEL" = "environment-branches" ]; then
+            tag="tree-$(git rev-parse 'HEAD^{tree}' | cut -c1-12)"
+          else
+            tag="$DEV_IMAGE_TAG"
+          fi
+          if ! az acr repository show --name "$ACR_NAME" --image "$IMAGE_REPOSITORY:$tag" -o none; then
+            echo "::error::No dev image $IMAGE_REPOSITORY:$tag. With environment branches, this code was never built on dev: make the change on dev first, then promote dev -> qa."
+            exit 1
+          fi
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "Promoting $IMAGE_REPOSITORY:$tag"
 
       - name: Deploy and verify
         run: *deploy
