@@ -29,11 +29,13 @@
 #   - Optional staticwebapp.config.<env>.json, copied to staticwebapp.config.json at deploy.
 #   - Optional Front Door: when infra outputs a frontDoorId, the pipeline locks the Static Web App to
 #     that Front Door (networking + forwardingGateway in staticwebapp.config.json) and verifies through
-#     publicHostname; the direct azurestaticapps.net address must then be refused.
+#     publicHostname; the direct azurestaticapps.net address must then be refused. The site's domain
+#     (wafDomainId output) must be in one of the profile's security policies (the central WAF one,
+#     added by the platform team), or the run fails before uploading.
 #   - GET /api/health returning {"version": process.env.NEXT_PUBLIC_APP_VERSION}, and the
 #     /api/bff/* server-side proxy to the BFF.
 #   - infra/main.bicep with outputs staticWebAppName and defaultHostname (optionally publicHostname,
-#     frontDoorId, dnsCnameTarget, dnsValidationToken); infra/<env>.bicepparam.
+#     frontDoorId, dnsCnameTarget, dnsValidationToken, wafDomainId); infra/<env>.bicepparam.
 #   - GitHub environments "dev" and "qa" with variables AZURE_CLIENT_ID, AZURE_TENANT_ID,
 #     AZURE_SUBSCRIPTION_ID, RESOURCE_GROUP, and a federated credential for
 #     <prefix>:environment:<env> on each AZURE_CLIENT_ID.
@@ -316,7 +318,35 @@ jobs:
             echo "front-door-id=$(jq -r '.properties.outputs.frontDoorId.value // ""' deployment.json)"
             echo "dns-cname=$(jq -r '.properties.outputs.dnsCnameTarget.value // ""' deployment.json)"
             echo "dns-token=$(jq -r '.properties.outputs.dnsValidationToken.value // ""' deployment.json)"
+            echo "waf-domain-id=$(jq -r '.properties.outputs.wafDomainId.value // ""' deployment.json)"
           } >> "$GITHUB_OUTPUT"
+
+      # A WAF policy can sit in only one security policy per Front Door profile, so sites don't link
+      # themselves: the platform team lists each site's domain in the central one. Until then, stop
+      # here rather than ship to a public address without the WAF.
+      - name: WAF coverage
+        if: steps.infra.outputs.waf-domain-id != ''
+        env:
+          WAF_DOMAIN_ID: ${{ steps.infra.outputs.waf-domain-id }}
+        run: &waf-coverage |
+          set -euo pipefail
+          profile_id="${WAF_DOMAIN_ID%/afdEndpoints/*}"
+          profile_id="${profile_id%/customDomains/*}"
+          policies=$(az rest --method get --url "https://management.azure.com${profile_id}/securityPolicies?api-version=2025-06-01")
+          covered_by=$(jq -r --arg id "${WAF_DOMAIN_ID,,}" '
+            [.value[] | select(any(.properties.parameters.associations[]?.domains[]?; (.id | ascii_downcase) == $id)) | .name] | join(", ")
+          ' <<< "$policies")
+          if [ -z "$covered_by" ]; then
+            {
+              echo "### Not covered by the WAF yet"
+              echo "Ask the platform team to add this domain to the central Front Door security policy, then re-run:"
+              echo ""
+              echo "\`$WAF_DOMAIN_ID\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$WAF_DOMAIN_ID isn't in any Front Door security policy, so the WAF doesn't cover it. Ask the platform team to add it to the central one (see the run summary), then re-run."
+            exit 1
+          fi
+          echo "Covered by security policy: $covered_by"
 
       # Read at deploy time and masked: no deployment-token secret is stored in the repo.
       - name: Deployment token
@@ -481,6 +511,12 @@ jobs:
       - name: Deploy infrastructure
         id: infra
         run: *deploy-infra
+
+      - name: WAF coverage
+        if: steps.infra.outputs.waf-domain-id != ''
+        env:
+          WAF_DOMAIN_ID: ${{ steps.infra.outputs.waf-domain-id }}
+        run: *waf-coverage
 
       - name: Deployment token
         id: token
