@@ -464,7 +464,7 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
-          if ! git log origin/dev --format=%T | grep -qx "$tree"; then
+          if ! git log origin/dev --format=%T | grep -x "$tree" > /dev/null; then  # not grep -q: with pipefail, its early exit fails git log (SIGPIPE)
             echo "::error::This qa commit's code (tree $tree) was never on dev. Make the change on dev first, then promote dev -> qa."
             exit 1
           fi
