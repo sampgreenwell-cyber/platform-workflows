@@ -1,0 +1,101 @@
+# Shared teardown for repos from the .NET template: terraform destroy of the service's
+# Container App, using the same state key as container-app-v2.yaml. The caller passes the
+# repository name typed by the person running it; anything else stops the run.
+#
+#   on:
+#     workflow_dispatch:
+#       inputs:
+#         confirm: { description: Type the repository name to confirm, required: true, type: string }
+#   permissions:
+#     contents: read
+#     id-token: write
+#   jobs:
+#     destroy:
+#       uses: sampgreenwell-cyber/platform-workflows/.github/workflows/destroy-container-app-v2.yaml@v1
+#       with:
+#         confirm: ${{ inputs.confirm }}
+#
+# v2 (this file): no repo secrets; reads the pipeline secrets from Vault like container-app-v2.yaml.
+
+name: Destroy Container App (Terraform, Vault)
+
+on:
+  workflow_call:
+    inputs:
+      confirm:
+        description: Must equal the calling repository's name
+        type: string
+        required: true
+
+jobs:
+  destroy:
+    name: Terraform destroy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      REPO_NAME: ${{ github.event.repository.name }}
+    steps:
+      - name: Confirm
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          if [ "$CONFIRM" != "$REPO_NAME" ]; then
+            echo "::error::Confirmation '$CONFIRM' does not match the repository name '$REPO_NAME'. Nothing was destroyed."
+            exit 1
+          fi
+
+      - name: Read pipeline secrets from Vault
+        # Pinned to the v4.0.0 commit.
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          path: jwt
+          role: platform-pipeline
+          jwtGithubAudience: vault
+          secrets: |
+            kv/data/platform/pipeline AZURE_CLIENT_ID | ARM_CLIENT_ID ;
+            kv/data/platform/pipeline AZURE_CLIENT_SECRET | ARM_CLIENT_SECRET ;
+            kv/data/platform/pipeline AZURE_TENANT_ID | ARM_TENANT_ID ;
+            kv/data/platform/pipeline AZURE_SUBSCRIPTION_ID | ARM_SUBSCRIPTION_ID ;
+            kv/data/platform/pipeline TFSTATE_RG | TFSTATE_RG ;
+            kv/data/platform/pipeline TFSTATE_SA | TFSTATE_SA ;
+            kv/data/platform/pipeline TFSTATE_CONTAINER | TFSTATE_CONTAINER ;
+            kv/data/platform/pipeline SHARED_CAE_ID | SHARED_CAE_ID ;
+            kv/data/platform/pipeline GHCR_PAT | GHCR_PAT
+
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$REPO_NAME.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=$ARM_CLIENT_ID" \
+            -backend-config="client_secret=$ARM_CLIENT_SECRET" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+      # Variables are required by the module but unused by destroy; the image value is a placeholder.
+      - name: Terraform destroy
+        working-directory: infra
+        env:
+          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="service_name=$REPO_NAME" \
+            -var="image=unused-for-destroy" \
+            -var="container_apps_environment_id=$SHARED_CAE_ID" \
+            -var="ghcr_pat=$GHCR_PAT" \
+            -var="ghcr_username=$GITHUB_ACTOR" \
+            -var="vault_addr=$VAULT_ADDR"

@@ -1,0 +1,139 @@
+# Shared pipeline: build the repo's Dockerfile, push to GHCR, deploy with the repo's infra/
+# Terraform (sampgreenwell-cyber/terraform-modules container-app-service). Used by repos from
+# the .NET template:
+#
+#   permissions:
+#     contents: read
+#     packages: write
+#     id-token: write
+#   jobs:
+#     deploy:
+#       uses: sampgreenwell-cyber/platform-workflows/.github/workflows/container-app-v2.yaml@v1
+#
+# Inside a called workflow, github.* is the calling repo: checkout, the repo name (service name
+# and state key) and infra/ all come from the service.
+#
+# v2 (this file): no repo secrets. Each job logs in to Vault with the job's GitHub OIDC token (jwt/
+# role platform-pipeline, which only trusts this file and destroy-container-app-v2.yaml at
+# refs/tags/v1) and reads the pipeline
+# secrets from kv/platform/pipeline. The caller sets one repo variable, VAULT_ADDR, and its
+# infra/ must accept a vault_addr variable (passed to the app for runtime secrets).
+#
+# container-app.yaml is the v1 pipeline (repo secrets from set-platform-secrets.ps1,
+# secrets: inherit). Both ship on the v1 tag; see README > Versioning.
+
+name: Container App (Terraform, Vault)
+
+on:
+  workflow_call: {}
+
+jobs:
+  build-and-push:
+    name: Build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - name: Check repo variables
+        env:
+          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+        run: |
+          if [ -z "$VAULT_ADDR" ]; then echo "::error::Repo variable VAULT_ADDR is not set. Set it with: gh variable set VAULT_ADDR --repo $GITHUB_REPOSITORY --body https://<vault fqdn>"; exit 1; fi
+
+      - name: Read pipeline secrets from Vault
+        # Pinned to the v4.0.0 commit.
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          path: jwt
+          role: platform-pipeline
+          jwtGithubAudience: vault
+          secrets: |
+            kv/data/platform/pipeline GHCR_PAT | GHCR_PAT
+
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        # GHCR image names must be lowercase.
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "$GHCR_PAT" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy:
+    name: Terraform apply
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: deploy-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Read pipeline secrets from Vault
+        # Pinned to the v4.0.0 commit.
+        uses: hashicorp/vault-action@892a26828f195e65540a40b4768ae4571f51ebfc
+        with:
+          url: ${{ vars.VAULT_ADDR }}
+          method: jwt
+          path: jwt
+          role: platform-pipeline
+          jwtGithubAudience: vault
+          secrets: |
+            kv/data/platform/pipeline AZURE_CLIENT_ID | ARM_CLIENT_ID ;
+            kv/data/platform/pipeline AZURE_CLIENT_SECRET | ARM_CLIENT_SECRET ;
+            kv/data/platform/pipeline AZURE_TENANT_ID | ARM_TENANT_ID ;
+            kv/data/platform/pipeline AZURE_SUBSCRIPTION_ID | ARM_SUBSCRIPTION_ID ;
+            kv/data/platform/pipeline TFSTATE_RG | TFSTATE_RG ;
+            kv/data/platform/pipeline TFSTATE_SA | TFSTATE_SA ;
+            kv/data/platform/pipeline TFSTATE_CONTAINER | TFSTATE_CONTAINER ;
+            kv/data/platform/pipeline SHARED_CAE_ID | SHARED_CAE_ID ;
+            kv/data/platform/pipeline GHCR_PAT | GHCR_PAT
+
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: infra
+        env:
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$REPO_NAME.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=$ARM_CLIENT_ID" \
+            -backend-config="client_secret=$ARM_CLIENT_SECRET" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+      - name: Terraform apply
+        working-directory: infra
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+        run: |
+          terraform apply -auto-approve \
+            -var="service_name=$REPO_NAME" \
+            -var="image=$IMAGE" \
+            -var="container_apps_environment_id=$SHARED_CAE_ID" \
+            -var="ghcr_pat=$GHCR_PAT" \
+            -var="ghcr_username=$GITHUB_ACTOR" \
+            -var="vault_addr=$VAULT_ADDR"
