@@ -15,8 +15,9 @@
 #
 # v2 (this file): no repo secrets. Each job logs in to Vault with the job's GitHub OIDC token (jwt/
 # role platform-pipeline, which only trusts this file and destroy-container-app-v2.yaml at
-# refs/tags/v1) and reads the pipeline
-# secrets from kv/platform/pipeline. The caller sets one repo variable, VAULT_ADDR, and its
+# refs/tags/v1) and reads the pipeline settings from kv/platform/pipeline. The deploy job's Azure
+# credential is a fresh one per run from Vault's Azure secrets engine (azure/creds/pipeline), which
+# the job revokes when it ends. The caller sets one repo variable, VAULT_ADDR, and its
 # infra/ must accept a vault_addr variable (passed to the app for runtime secrets).
 #
 # container-app.yaml is the v1 pipeline (repo secrets from set-platform-secrets.ps1,
@@ -93,9 +94,11 @@ jobs:
           path: jwt
           role: platform-pipeline
           jwtGithubAudience: vault
+          # The revoke step at the end needs the token (VAULT_TOKEN, masked).
+          exportToken: true
           secrets: |
-            kv/data/platform/pipeline AZURE_CLIENT_ID | ARM_CLIENT_ID ;
-            kv/data/platform/pipeline AZURE_CLIENT_SECRET | ARM_CLIENT_SECRET ;
+            azure/creds/pipeline client_id | ARM_CLIENT_ID ;
+            azure/creds/pipeline client_secret | ARM_CLIENT_SECRET ;
             kv/data/platform/pipeline AZURE_TENANT_ID | ARM_TENANT_ID ;
             kv/data/platform/pipeline AZURE_SUBSCRIPTION_ID | ARM_SUBSCRIPTION_ID ;
             kv/data/platform/pipeline TFSTATE_RG | TFSTATE_RG ;
@@ -106,6 +109,24 @@ jobs:
 
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
+
+      # A new password can take a little while to be accepted by Entra ID. Ask for a token with it
+      # (what Terraform does next) every 10 s for up to 2 minutes. The secret goes to curl on stdin.
+      - name: Wait for the Azure credential
+        run: |
+          for i in $(seq 1 12); do
+            if printf '%s' "$ARM_CLIENT_SECRET" | curl -sf -o /dev/null \
+                 --data-urlencode client_secret@- \
+                 -d grant_type=client_credentials -d "client_id=$ARM_CLIENT_ID" \
+                 -d scope=https://management.azure.com/.default \
+                 "https://login.microsoftonline.com/$ARM_TENANT_ID/oauth2/v2.0/token"; then
+              echo "Azure credential accepted after $(( (i - 1) * 10 ))s."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Entra ID didn't accept the credential from azure/creds/pipeline within 2 minutes."
+          exit 1
 
       - name: Terraform init
         working-directory: infra
@@ -137,3 +158,17 @@ jobs:
             -var="ghcr_pat=$GHCR_PAT" \
             -var="ghcr_username=$GITHUB_ACTOR" \
             -var="vault_addr=$VAULT_ADDR"
+
+      # Revoking the job's Vault token also revokes every lease it created, so Vault deletes this
+      # run's Azure password now. If this never runs, it goes when the token expires (<= 30 min).
+      - name: Revoke the Vault token
+        if: always()
+        env:
+          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+        run: |
+          if [ -z "${VAULT_TOKEN:-}" ]; then echo "No Vault token to revoke."; exit 0; fi
+          if curl -sf -o /dev/null -X POST -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/auth/token/revoke-self"; then
+            echo "Vault token and its leases revoked."
+          else
+            echo "::warning::Couldn't revoke the Vault token; its Azure credential is deleted when the token expires."
+          fi

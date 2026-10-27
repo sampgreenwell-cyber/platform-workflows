@@ -6,8 +6,8 @@ Reusable GitHub Actions workflows called by repos generated from `sampgreenwell-
 |---|---|---|
 | `container-app.yaml` | `dotnet-service` template | Build the Dockerfile, push to GHCR, `terraform apply` the repo's `infra/` (module `terraform-modules//container-app-service`). Auth: repo secrets from `set-platform-secrets.ps1`. |
 | `destroy-container-app.yaml` | `dotnet-service` template | `terraform destroy` of that service, after the person running it types the repo name. |
-| `container-app-v2.yaml` | `dotnet-service` template (new services) | Same as `container-app.yaml`, but no repo secrets: each job logs in to Vault with GitHub OIDC and reads the pipeline secrets from `kv/platform/pipeline`. Needs repo variable `VAULT_ADDR`; passes `vault_addr` to `infra/`. |
-| `destroy-container-app-v2.yaml` | `dotnet-service` template (new services) | `destroy-container-app.yaml` with the same Vault login. |
+| `container-app-v2.yaml` | `dotnet-service` template (new services) | Same as `container-app.yaml`, but no repo secrets: each job logs in to Vault with GitHub OIDC and reads the pipeline settings from `kv/platform/pipeline`. The deploy job's Azure credential is a new one per run from `azure/creds/pipeline` (Vault's Azure secrets engine), revoked when the job ends. Needs repo variable `VAULT_ADDR`; passes `vault_addr` to `infra/`. |
+| `destroy-container-app-v2.yaml` | `dotnet-service` template (new services) | `destroy-container-app.yaml` with the same Vault login and per-run Azure credential. |
 | `bicep-container-app.yaml` | `spring-container-app-lab` template | The same file as the work golden path: Maven build/test, Snyk, one image to ACR, Bicep deploy to dev, promotion to qa after approval. Auth: OIDC with GitHub environment variables. |
 | `bicep-static-web-app.yaml` | `nextjs-web-app-lab` template | The same file as the work golden path: npm build/test, Snyk, Bicep (Static Web App + its APIM subscription to the BFF), build with `.env.<env>` and upload with a deploy token read at deploy time, then check `/api/health` and `/api/bff/health`. Auth: OIDC. |
 
