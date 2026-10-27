@@ -6,8 +6,8 @@ Reusable GitHub Actions workflows called by repos generated from `sampgreenwell-
 |---|---|---|
 | `container-app.yaml` | `dotnet-service` template | Build the Dockerfile, push to GHCR, `terraform apply` the repo's `infra/` (module `terraform-modules//container-app-service`). Auth: repo secrets from `set-platform-secrets.ps1`. |
 | `destroy-container-app.yaml` | `dotnet-service` template | `terraform destroy` of that service, after the person running it types the repo name. |
-| `container-app-v2.yaml` | `dotnet-service` template (new services) | Same as `container-app.yaml`, but no repo secrets: each job logs in to Vault with GitHub OIDC and reads the pipeline settings from `kv/platform/pipeline`. The deploy job's Azure credential is a new one per run from `azure/creds/pipeline` (Vault's Azure secrets engine), revoked when the job ends. Needs repo variable `VAULT_ADDR`; passes `vault_addr` to `infra/`. |
-| `destroy-container-app-v2.yaml` | `dotnet-service` template (new services) | `destroy-container-app.yaml` with the same Vault login and per-run Azure credential. |
+| `container-app-v2.yaml` | `dotnet-service` template (new services) | Same as `container-app.yaml`, but no repo secrets: each job logs in to Vault with GitHub OIDC and reads the pipeline settings from `kv/platform/pipeline`, and the deploy job signs in to Azure with the same OIDC token (no Azure secret). Needs repo variable `VAULT_ADDR` and the repo's OIDC subject template set to `job_workflow_ref` (below); passes `vault_addr` to `infra/`. |
+| `destroy-container-app-v2.yaml` | `dotnet-service` template (new services) | `destroy-container-app.yaml` with the same Vault and Azure OIDC logins. |
 | `bicep-container-app.yaml` | `spring-container-app-lab` template | The same file as the work golden path: Maven build/test, Snyk, one image to ACR, Bicep deploy to dev, promotion to qa after approval. Auth: OIDC with GitHub environment variables. |
 | `bicep-static-web-app.yaml` | `nextjs-web-app-lab` template | The same file as the work golden path: npm build/test, Snyk, Bicep (Static Web App + its APIM subscription to the BFF), build with `.env.<env>` and upload with a deploy token read at deploy time, then check `/api/health` and `/api/bff/health`. Auth: OIDC. |
 
@@ -33,6 +33,14 @@ jobs:
     uses: sampgreenwell-cyber/platform-workflows/.github/workflows/container-app-v2.yaml@v1
 ```
 Vault (`sampgreenwell-cyber/vault`, role `platform-pipeline`) trusts only the `-v2` files at `refs/tags/v1`, so a service repo can't read the pipeline secrets with a workflow of its own. Renaming or moving those files means updating the role's `job_workflow_ref` in that repo's `config/`.
+
+Azure trusts the same two files the same way: `sp-vault-pipeline` (in that repo's `infra/`) has a federated credential per file whose subject is `job_workflow_ref:sampgreenwell-cyber/platform-workflows/.github/workflows/<file>@refs/tags/v1`. GitHub only sends that subject when the calling repo's OIDC subject template includes `job_workflow_ref`, so set it once per service repo:
+```bash
+gh api -X PUT repos/<owner>/<repo>/actions/oidc/customization/sub --input - <<'JSON'
+{"use_default": false, "include_claim_keys": ["job_workflow_ref"]}
+JSON
+```
+Without it, the Azure login fails with `AADSTS700213` (no matching federated identity record). Renaming the files or releasing them under another tag also means updating those credentials.
 
 ## Access
 - If this repo is **public**, any repo can call it; no setting needed.

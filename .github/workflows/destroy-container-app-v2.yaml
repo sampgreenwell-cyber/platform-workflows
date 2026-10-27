@@ -15,8 +15,8 @@
 #       with:
 #         confirm: ${{ inputs.confirm }}
 #
-# v2 (this file): no repo secrets; reads the pipeline settings and a per-run Azure credential from
-# Vault like container-app-v2.yaml's deploy job, and revokes it at the end.
+# v2 (this file): no repo secrets; reads the pipeline settings from Vault and signs in to Azure with
+# OIDC, like container-app-v2.yaml.
 
 name: Destroy Container App (Terraform, Vault)
 
@@ -40,6 +40,9 @@ jobs:
       cancel-in-progress: false
     env:
       REPO_NAME: ${{ github.event.repository.name }}
+      # Azure sign-in: the job's GitHub OIDC token, exchanged with Entra ID for sp-vault-pipeline
+      # (ARM_CLIENT_ID from Vault). No client secret anywhere.
+      ARM_USE_OIDC: "true"
     steps:
       - name: Confirm
         env:
@@ -59,11 +62,8 @@ jobs:
           path: jwt
           role: platform-pipeline
           jwtGithubAudience: vault
-          # The revoke step at the end needs the token (VAULT_TOKEN, masked).
-          exportToken: true
           secrets: |
-            azure/creds/pipeline client_id | ARM_CLIENT_ID ;
-            azure/creds/pipeline client_secret | ARM_CLIENT_SECRET ;
+            kv/data/platform/pipeline AZURE_CLIENT_ID | ARM_CLIENT_ID ;
             kv/data/platform/pipeline AZURE_TENANT_ID | ARM_TENANT_ID ;
             kv/data/platform/pipeline AZURE_SUBSCRIPTION_ID | ARM_SUBSCRIPTION_ID ;
             kv/data/platform/pipeline TFSTATE_RG | TFSTATE_RG ;
@@ -75,93 +75,30 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
 
-      # A new password reaches Entra ID's servers unevenly: for the first minutes some logins
-      # succeed and some are refused (AADSTS7000215), with no clean point where all agree. Wait for
-      # the first accepted login (5 s apart, up to 3 minutes), then let the Terraform steps retry.
-      # Each probe is a token request like Terraform's; the secret goes to curl on stdin.
-      # CRED_ISSUED_AT is for the revoke step.
-      - name: Wait for the Azure credential
-        run: |
-          echo "CRED_ISSUED_AT=$(date +%s)" >> "$GITHUB_ENV"
-          for i in $(seq 1 36); do
-            if printf '%s' "$ARM_CLIENT_SECRET" | curl -sf -o /dev/null \
-                 --data-urlencode client_secret@- \
-                 -d grant_type=client_credentials -d "client_id=$ARM_CLIENT_ID" \
-                 -d scope=https://management.azure.com/.default \
-                 "https://login.microsoftonline.com/$ARM_TENANT_ID/oauth2/v2.0/token"; then
-              echo "Azure credential first accepted after $(( (i - 1) * 5 ))s."
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "::error::Entra ID didn't accept the credential from azure/creds/pipeline within 3 minutes."
-          exit 1
-
       - name: Terraform init
         working-directory: infra
-        # Retried: a just-issued credential can still be refused by a lagging Entra ID server.
         run: |
-          for attempt in 1 2 3 4 5; do
-            terraform init \
-              -backend-config="resource_group_name=$TFSTATE_RG" \
-              -backend-config="storage_account_name=$TFSTATE_SA" \
-              -backend-config="container_name=$TFSTATE_CONTAINER" \
-              -backend-config="key=$REPO_NAME.tfstate" \
-              -backend-config="use_azuread_auth=true" \
-              -backend-config="client_id=$ARM_CLIENT_ID" \
-              -backend-config="client_secret=$ARM_CLIENT_SECRET" \
-              -backend-config="tenant_id=$ARM_TENANT_ID" \
-              -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID" && exit 0
-            echo "terraform init failed (attempt $attempt of 5)."
-            [ "$attempt" -lt 5 ] && sleep 20
-          done
-          exit 1
+          terraform init \
+            -backend-config="resource_group_name=$TFSTATE_RG" \
+            -backend-config="storage_account_name=$TFSTATE_SA" \
+            -backend-config="container_name=$TFSTATE_CONTAINER" \
+            -backend-config="key=$REPO_NAME.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="client_id=$ARM_CLIENT_ID" \
+            -backend-config="use_oidc=true" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
 
       # Variables are required by the module but unused by destroy; the image value is a placeholder.
       - name: Terraform destroy
         working-directory: infra
         env:
           VAULT_ADDR: ${{ vars.VAULT_ADDR }}
-        # Retried only when Entra ID still refuses the new credential (AADSTS7000215): that happens
-        # while Terraform builds its Azure client, before it changes anything.
         run: |
-          for attempt in 1 2 3 4 5; do
-            set +e
-            terraform destroy -auto-approve \
-              -var="service_name=$REPO_NAME" \
-              -var="image=unused-for-destroy" \
-              -var="container_apps_environment_id=$SHARED_CAE_ID" \
-              -var="ghcr_pat=$GHCR_PAT" \
-              -var="ghcr_username=$GITHUB_ACTOR" \
-              -var="vault_addr=$VAULT_ADDR" 2>&1 | tee "$RUNNER_TEMP/terraform.log"
-            rc=${PIPESTATUS[0]}
-            set -e
-            [ "$rc" -eq 0 ] && exit 0
-            if [ "$attempt" -eq 5 ] || ! grep -q AADSTS7000215 "$RUNNER_TEMP/terraform.log"; then exit "$rc"; fi
-            echo "Entra ID refused the new credential (AADSTS7000215); retrying in 20s (attempt $attempt of 5)."
-            sleep 20
-          done
-
-      # Revoking the job's Vault token also revokes every lease it created, so Vault deletes this
-      # run's Azure password now. If this never runs, it goes when the token expires (<= 30 min).
-      - name: Revoke the Vault token
-        if: always()
-        env:
-          VAULT_ADDR: ${{ vars.VAULT_ADDR }}
-        run: |
-          if [ -z "${VAULT_TOKEN:-}" ]; then echo "No Vault token to revoke."; exit 0; fi
-          # Vault treats "password not found" as already deleted. Revoking a password younger than
-          # about a minute can reach a Graph replica that hasn't seen it yet, leaving it behind
-          # until its Entra end date (explicit_max_ttl, 2h). So let it age first.
-          if [ -n "${CRED_ISSUED_AT:-}" ]; then
-            age=$(( $(date +%s) - CRED_ISSUED_AT ))
-            if [ "$age" -lt 60 ]; then
-              echo "Credential is ${age}s old; waiting $(( 60 - age ))s before revoking."
-              sleep $(( 60 - age ))
-            fi
-          fi
-          if curl -sf -o /dev/null -X POST -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/auth/token/revoke-self"; then
-            echo "Vault token and its leases revoked."
-          else
-            echo "::warning::Couldn't revoke the Vault token; its Azure credential is deleted when the token expires."
-          fi
+          terraform destroy -auto-approve \
+            -var="service_name=$REPO_NAME" \
+            -var="image=unused-for-destroy" \
+            -var="container_apps_environment_id=$SHARED_CAE_ID" \
+            -var="ghcr_pat=$GHCR_PAT" \
+            -var="ghcr_username=$GITHUB_ACTOR" \
+            -var="vault_addr=$VAULT_ADDR"
