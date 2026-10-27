@@ -75,37 +75,51 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
 
-      # A new password can take a little while to be accepted by Entra ID. Ask for a token with it
-      # (what Terraform does next) every 10 s for up to 2 minutes. The secret goes to curl on stdin.
+      # A new password reaches Entra ID's servers one by one, so one accepted login isn't proof:
+      # wait for 3 in a row (5 s apart, up to 3 minutes). Each is a token request like Terraform's
+      # next one; the secret goes to curl on stdin. CRED_ISSUED_AT is for the revoke step.
       - name: Wait for the Azure credential
         run: |
-          for i in $(seq 1 12); do
+          echo "CRED_ISSUED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          ok=0
+          for i in $(seq 1 36); do
             if printf '%s' "$ARM_CLIENT_SECRET" | curl -sf -o /dev/null \
                  --data-urlencode client_secret@- \
                  -d grant_type=client_credentials -d "client_id=$ARM_CLIENT_ID" \
                  -d scope=https://management.azure.com/.default \
                  "https://login.microsoftonline.com/$ARM_TENANT_ID/oauth2/v2.0/token"; then
-              echo "Azure credential accepted after $(( (i - 1) * 10 ))s."
-              exit 0
+              ok=$((ok + 1))
+              if [ "$ok" -ge 3 ]; then
+                echo "Azure credential accepted 3 times in a row after $(( (i - 1) * 5 ))s."
+                exit 0
+              fi
+            else
+              ok=0
             fi
-            sleep 10
+            sleep 5
           done
-          echo "::error::Entra ID didn't accept the credential from azure/creds/pipeline within 2 minutes."
+          echo "::error::Entra ID didn't consistently accept the credential from azure/creds/pipeline within 3 minutes."
           exit 1
 
       - name: Terraform init
         working-directory: infra
+        # Retried: a just-issued credential can still be refused by a lagging Entra ID server.
         run: |
-          terraform init \
-            -backend-config="resource_group_name=$TFSTATE_RG" \
-            -backend-config="storage_account_name=$TFSTATE_SA" \
-            -backend-config="container_name=$TFSTATE_CONTAINER" \
-            -backend-config="key=$REPO_NAME.tfstate" \
-            -backend-config="use_azuread_auth=true" \
-            -backend-config="client_id=$ARM_CLIENT_ID" \
-            -backend-config="client_secret=$ARM_CLIENT_SECRET" \
-            -backend-config="tenant_id=$ARM_TENANT_ID" \
-            -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+          for attempt in 1 2 3; do
+            terraform init \
+              -backend-config="resource_group_name=$TFSTATE_RG" \
+              -backend-config="storage_account_name=$TFSTATE_SA" \
+              -backend-config="container_name=$TFSTATE_CONTAINER" \
+              -backend-config="key=$REPO_NAME.tfstate" \
+              -backend-config="use_azuread_auth=true" \
+              -backend-config="client_id=$ARM_CLIENT_ID" \
+              -backend-config="client_secret=$ARM_CLIENT_SECRET" \
+              -backend-config="tenant_id=$ARM_TENANT_ID" \
+              -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID" && exit 0
+            echo "terraform init failed (attempt $attempt of 3)."
+            [ "$attempt" -lt 3 ] && sleep 15
+          done
+          exit 1
 
       # Variables are required by the module but unused by destroy; the image value is a placeholder.
       - name: Terraform destroy
@@ -129,6 +143,16 @@ jobs:
           VAULT_ADDR: ${{ vars.VAULT_ADDR }}
         run: |
           if [ -z "${VAULT_TOKEN:-}" ]; then echo "No Vault token to revoke."; exit 0; fi
+          # Vault treats "password not found" as already deleted. Revoking a password younger than
+          # about a minute can reach a Graph replica that hasn't seen it yet, leaving it behind
+          # until its Entra end date (explicit_max_ttl, 2h). So let it age first.
+          if [ -n "${CRED_ISSUED_AT:-}" ]; then
+            age=$(( $(date +%s) - CRED_ISSUED_AT ))
+            if [ "$age" -lt 60 ]; then
+              echo "Credential is ${age}s old; waiting $(( 60 - age ))s before revoking."
+              sleep $(( 60 - age ))
+            fi
+          fi
           if curl -sf -o /dev/null -X POST -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/auth/token/revoke-self"; then
             echo "Vault token and its leases revoked."
           else
