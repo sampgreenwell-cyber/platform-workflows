@@ -75,30 +75,31 @@ jobs:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
 
-      # A new password reaches Entra ID's servers one by one, so one accepted login isn't proof:
-      # wait for 3 in a row (5 s apart, up to 3 minutes). Each is a token request like Terraform's
-      # next one; the secret goes to curl on stdin. CRED_ISSUED_AT is for the revoke step.
+      # A new password reaches Entra ID's servers one by one, and they can disagree for a while:
+      # wait until it has been accepted for about a minute without a miss (7 logins in a row, 10 s
+      # apart, up to 4 minutes). Each is a token request like Terraform's; the secret goes to curl
+      # on stdin. CRED_ISSUED_AT is for the revoke step.
       - name: Wait for the Azure credential
         run: |
           echo "CRED_ISSUED_AT=$(date +%s)" >> "$GITHUB_ENV"
           ok=0
-          for i in $(seq 1 36); do
+          for i in $(seq 1 24); do
             if printf '%s' "$ARM_CLIENT_SECRET" | curl -sf -o /dev/null \
                  --data-urlencode client_secret@- \
                  -d grant_type=client_credentials -d "client_id=$ARM_CLIENT_ID" \
                  -d scope=https://management.azure.com/.default \
                  "https://login.microsoftonline.com/$ARM_TENANT_ID/oauth2/v2.0/token"; then
               ok=$((ok + 1))
-              if [ "$ok" -ge 3 ]; then
-                echo "Azure credential accepted 3 times in a row after $(( (i - 1) * 5 ))s."
+              if [ "$ok" -ge 7 ]; then
+                echo "Azure credential accepted 7 times in a row; ready after $(( (i - 1) * 10 ))s."
                 exit 0
               fi
             else
               ok=0
             fi
-            sleep 5
+            sleep 10
           done
-          echo "::error::Entra ID didn't consistently accept the credential from azure/creds/pipeline within 3 minutes."
+          echo "::error::Entra ID didn't consistently accept the credential from azure/creds/pipeline within 4 minutes."
           exit 1
 
       - name: Terraform init
@@ -126,14 +127,25 @@ jobs:
         working-directory: infra
         env:
           VAULT_ADDR: ${{ vars.VAULT_ADDR }}
+        # Retried only when Entra ID still refuses the new credential (AADSTS7000215): that happens
+        # while Terraform builds its Azure client, before it changes anything.
         run: |
-          terraform destroy -auto-approve \
-            -var="service_name=$REPO_NAME" \
-            -var="image=unused-for-destroy" \
-            -var="container_apps_environment_id=$SHARED_CAE_ID" \
-            -var="ghcr_pat=$GHCR_PAT" \
-            -var="ghcr_username=$GITHUB_ACTOR" \
-            -var="vault_addr=$VAULT_ADDR"
+          for attempt in 1 2 3; do
+            set +e
+            terraform destroy -auto-approve \
+              -var="service_name=$REPO_NAME" \
+              -var="image=unused-for-destroy" \
+              -var="container_apps_environment_id=$SHARED_CAE_ID" \
+              -var="ghcr_pat=$GHCR_PAT" \
+              -var="ghcr_username=$GITHUB_ACTOR" \
+              -var="vault_addr=$VAULT_ADDR" 2>&1 | tee "$RUNNER_TEMP/terraform.log"
+            rc=${PIPESTATUS[0]}
+            set -e
+            [ "$rc" -eq 0 ] && exit 0
+            if [ "$attempt" -eq 3 ] || ! grep -q AADSTS7000215 "$RUNNER_TEMP/terraform.log"; then exit "$rc"; fi
+            echo "Entra ID refused the new credential (AADSTS7000215); retrying in 30s (attempt $attempt of 3)."
+            sleep 30
+          done
 
       # Revoking the job's Vault token also revokes every lease it created, so Vault deletes this
       # run's Azure password now. If this never runs, it goes when the token expires (<= 30 min).
